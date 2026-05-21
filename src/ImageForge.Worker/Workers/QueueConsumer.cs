@@ -2,6 +2,7 @@ using System.Text;
 using System.Text.Json;
 using ImageForge.Shared.Contracts;
 using ImageForge.Shared.Messaging;
+using ImageForge.Worker.Services;
 using Microsoft.Extensions.Options;
 using RabbitMQ.Client;
 using RabbitMQ.Client.Events;
@@ -9,18 +10,23 @@ using RabbitMQ.Client.Events;
 namespace ImageForge.Worker.Workers;
 
 // Long-running consumer registered as a HostedService. Connects to RabbitMQ,
-// subscribes to the task queue and handles messages one at a time per worker.
-// Real image processing lands in M4; for now we only log what we received.
+// subscribes to the task queue and processes messages one at a time per worker.
+// On success: ack the message. On failure: nack without requeue (would loop).
 public sealed class QueueConsumer : BackgroundService
 {
     private readonly ILogger<QueueConsumer> _logger;
     private readonly RabbitMqOptions _options;
+    private readonly ImageProcessor _processor;
     private IConnection? _connection;
     private IModel? _channel;
 
-    public QueueConsumer(IOptions<RabbitMqOptions> options, ILogger<QueueConsumer> logger)
+    public QueueConsumer(
+        IOptions<RabbitMqOptions> options,
+        ImageProcessor processor,
+        ILogger<QueueConsumer> logger)
     {
         _options = options.Value;
+        _processor = processor;
         _logger = logger;
     }
 
@@ -31,7 +37,10 @@ public sealed class QueueConsumer : BackgroundService
             HostName = _options.Host,
             Port = _options.Port,
             UserName = _options.User,
-            Password = _options.Password
+            Password = _options.Password,
+            // Required so AsyncEventingBasicConsumer fires Received on the
+            // async pump rather than the regular thread pool.
+            DispatchConsumersAsync = true
         };
 
         _connection = factory.CreateConnection("imageforge-worker");
@@ -44,13 +53,12 @@ public sealed class QueueConsumer : BackgroundService
             autoDelete: false,
             arguments: null);
 
-        // Fair dispatch: never push more than one un-acked message at a time
-        // to this consumer. With multiple workers this makes RabbitMQ deliver
-        // the next task to whichever worker is currently idle, not round-robin.
+        // Fair dispatch: only push the next message when this worker acks the
+        // current one. With multiple workers this balances load by capacity.
         _channel.BasicQos(prefetchSize: 0, prefetchCount: 1, global: false);
 
-        var consumer = new EventingBasicConsumer(_channel);
-        consumer.Received += OnMessage;
+        var consumer = new AsyncEventingBasicConsumer(_channel);
+        consumer.Received += OnMessageAsync;
 
         _channel.BasicConsume(
             queue: _options.Queue,
@@ -60,17 +68,16 @@ public sealed class QueueConsumer : BackgroundService
         _logger.LogInformation("Worker consuming queue {Queue} on {Host}:{Port}",
             _options.Queue, _options.Host, _options.Port);
 
-        // ExecuteAsync needs to keep the HostedService alive; the consumer
-        // runs on RabbitMQ.Client's own threads via events.
         return Task.CompletedTask;
     }
 
-    private void OnMessage(object? sender, BasicDeliverEventArgs ea)
+    private async Task OnMessageAsync(object sender, BasicDeliverEventArgs ea)
     {
+        TaskMessage? message = null;
         try
         {
             var json = Encoding.UTF8.GetString(ea.Body.Span);
-            var message = JsonSerializer.Deserialize<TaskMessage>(json);
+            message = JsonSerializer.Deserialize<TaskMessage>(json);
 
             if (message is null)
             {
@@ -79,17 +86,19 @@ public sealed class QueueConsumer : BackgroundService
                 return;
             }
 
-            _logger.LogInformation(
-                "Received task {TaskId}: source={Source}, format={Format}, maxDim={MaxDim}",
-                message.TaskId, message.SourcePath, message.TargetFormat, message.MaxDimension);
+            _logger.LogInformation("Received task {TaskId}, starting processing", message.TaskId);
 
-            // M4 will do the actual ImageSharp work here.
+            await _processor.ProcessAsync(message, CancellationToken.None);
+
             _channel!.BasicAck(ea.DeliveryTag, multiple: false);
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Failed to handle message {DeliveryTag}", ea.DeliveryTag);
-            // Do not requeue on parse errors — would loop forever.
+            _logger.LogError(ex,
+                "Failed to process task {TaskId} (delivery {DeliveryTag})",
+                message?.TaskId ?? "<unknown>", ea.DeliveryTag);
+            // Do not requeue: malformed inputs or unsupported formats would loop forever.
+            // Persistent status with "failed" lands in M5.
             _channel!.BasicNack(ea.DeliveryTag, multiple: false, requeue: false);
         }
     }
