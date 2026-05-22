@@ -259,3 +259,26 @@ function escapeHtml(s) {
     '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
   }[c]));
 }
+
+// ---- Worker fleet — poll /api/stats every 2s ---------------------------------
+
+async function refreshStats() {
+  try {
+    const res = await fetch(API_BASE + '/api/stats');
+    if (!res.ok) return;
+    const s = await res.json();
+
+    document.getElementById('stat-consumers').textContent = s.available ? s.consumers : '—';
+    document.getElementById('stat-ready').textContent     = s.available ? s.messagesReady : '—';
+    document.getElementById('stat-inflight').textContent  = s.available ? s.messagesUnacknowledged : '—';
+
+    // Visual pulse: when consumers > 0, treat the workers row as "busy" so
+    // the dot pulses; when there is in-flight work, do the same for that row.
+    document.getElementById('wrk-consumers').classList.toggle('busy', s.consumers > 0);
+    document.getElementById('wrk-inflight').classList.toggle('busy', s.messagesUnacknowledged > 0);
+  } catch {
+    // Silently ignore — stats are best-effort.
+  }
+}
+refreshStats();
+setInterval(refreshStats, 2000);

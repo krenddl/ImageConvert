@@ -18,6 +18,7 @@ builder.Services.AddSingleton<ImageStorage>();
 builder.Services
     .AddOptions<RabbitMqOptions>()
     .Bind(builder.Configuration.GetSection(RabbitMqOptions.SectionName));
+builder.Services.AddSingleton(sp => sp.GetRequiredService<IOptions<RabbitMqOptions>>().Value);
 builder.Services.AddSingleton<QueuePublisher>();
 
 // Redis
@@ -34,6 +35,9 @@ builder.Services.AddSingleton<TaskStatusStore>();
 
 // Bridges Redis pub/sub -> SignalR.
 builder.Services.AddHostedService<TaskStatusBroadcaster>();
+
+// Tiny HTTP client to the RabbitMQ management API; used by /api/stats.
+builder.Services.AddHttpClient<QueueStatsClient>();
 
 var app = builder.Build();
 
@@ -58,5 +62,9 @@ if (Directory.Exists(frontendPath))
 
 app.MapImagesEndpoints();
 app.MapHub<TasksHub>("/hub/tasks");
+
+// Lightweight stats endpoint for the worker-fleet UI.
+app.MapGet("/api/stats", async (QueueStatsClient stats, CancellationToken ct)
+    => Results.Ok(await stats.GetAsync(ct)));
 
 app.Run();
