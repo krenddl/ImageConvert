@@ -145,6 +145,15 @@ body {
   font-family: 'EB Garamond', serif; font-weight: 500; font-size: 23px;
 }
 .shead .meta { margin-left: auto; font-family: 'JetBrains Mono', monospace; font-size: 12px; color: var(--muted); }
+.clear-btn {
+  margin-left: 16px; padding: 6px 14px; border-radius: 999px;
+  background: transparent; border: 1px solid var(--line-strong);
+  color: var(--muted); cursor: pointer;
+  font-family: 'JetBrains Mono', monospace; font-size: 11px;
+  letter-spacing: 1px; text-transform: uppercase;
+  transition: .25s;
+}
+.clear-btn:hover { border-color: var(--accent); color: var(--accent); }
 
 /* ---- task cards ---- */
 .cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(330px, 1fr)); gap: 16px; }

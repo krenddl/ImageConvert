@@ -245,14 +245,38 @@ function initSlider(cmp) {
 }
 
 function updateStats() {
-  const inflight = Array.from(tasks.values()).filter((t) => t.status !== 'done' && t.status !== 'failed').length;
+  const all = Array.from(tasks.values());
+  const inflight = all.filter((t) => t.status !== 'done' && t.status !== 'failed').length;
+  const finished = all.length - inflight;
+
   $('#qcount').textContent = inflight;
   $('#dcount').textContent = doneCount;
-  const total = tasks.size;
-  $('#qlabel').textContent = total
-    ? `${total} total · ${inflight} in flight`
+  $('#qlabel').textContent = all.length
+    ? `${all.length} total · ${inflight} in flight`
     : 'no tasks yet';
+
+  // Show the clear button only when there's something to clear.
+  const clearBtn = $('#clear-btn');
+  clearBtn.hidden = finished === 0;
+  clearBtn.textContent = `clear completed (${finished})`;
 }
+
+// Clear button: drops every finished task (done or failed) from the UI.
+// Server-side state and stored files are untouched; only the in-memory
+// view here is cleaned up.
+$('#clear-btn').addEventListener('click', () => {
+  for (const [id, t] of tasks) {
+    if (t.status === 'done' || t.status === 'failed') {
+      const el = document.getElementById('card-' + id);
+      if (el) el.remove();
+      tasks.delete(id);
+    }
+  }
+  if (tasks.size === 0) {
+    $('#empty').style.display = '';
+  }
+  updateStats();
+});
 
 function escapeHtml(s) {
   return String(s).replace(/[&<>"']/g, (c) => ({
