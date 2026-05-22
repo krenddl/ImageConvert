@@ -10,7 +10,8 @@ namespace ImageForge.Worker.Services;
 
 // The "what" of the worker: take a TaskMessage, load the source image,
 // optionally resize, re-encode in the requested format, write to results/.
-// Pure CPU work via ImageSharp - no external state.
+// Progress is reported through a caller-supplied callback so the processor
+// itself stays unaware of Redis or any other storage.
 public sealed class ImageProcessor
 {
     private readonly ILogger<ImageProcessor> _logger;
@@ -22,16 +23,19 @@ public sealed class ImageProcessor
         _logger = logger;
     }
 
-    public async Task<string> ProcessAsync(TaskMessage message, CancellationToken ct)
+    public async Task<string> ProcessAsync(
+        TaskMessage message,
+        Func<int, Task> reportProgress,
+        CancellationToken ct)
     {
-        // 1. Decode the source image from disk.
+        // 25% — file opened and decoded into memory.
         using var image = await Image.LoadAsync(message.SourcePath, ct);
+        await reportProgress(25);
 
         var originalWidth = image.Width;
         var originalHeight = image.Height;
 
-        // 2. Resize down to MaxDimension if either side exceeds it. ResizeMode.Max
-        //    fits the image into the box keeping aspect ratio, never upscaling.
+        // 60% — resize finished (or skipped).
         if (message.MaxDimension is int max && (originalWidth > max || originalHeight > max))
         {
             image.Mutate(x => x.Resize(new ResizeOptions
@@ -40,14 +44,14 @@ public sealed class ImageProcessor
                 Mode = ResizeMode.Max
             }));
         }
+        await reportProgress(60);
 
-        // 3. Pick the encoder matching the requested target format.
         IImageEncoder encoder = SelectEncoder(message.TargetFormat);
 
-        // 4. Persist the result. The file extension matches the encoder
-        //    so the OS / browser can recognise the format from the name.
+        // 90% — encoded and written to disk; the consumer will mark 100/done.
         var resultPath = _storage.BuildResultPath(message.TaskId, message.TargetFormat);
         await image.SaveAsync(resultPath, encoder, ct);
+        await reportProgress(90);
 
         _logger.LogInformation(
             "Processed task {TaskId}: {OriginalW}x{OriginalH} -> {NewW}x{NewH} as {Format} ({Path})",

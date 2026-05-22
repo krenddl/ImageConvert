@@ -102,7 +102,20 @@ public sealed class QueueConsumer : BackgroundService
                 ResultPath: null,
                 Error: null));
 
-            var resultPath = await _processor.ProcessAsync(message, CancellationToken.None);
+            // Local helper that the processor calls at each stage. Keeps the
+            // processor itself unaware of Redis or status persistence.
+            var taskIdLocal = message.TaskId;
+            Func<int, Task> report = async percent =>
+            {
+                await _statusStore.SetAsync(new TaskStatus(
+                    TaskId: taskIdLocal,
+                    State: TaskState.Processing,
+                    Progress: percent,
+                    ResultPath: null,
+                    Error: null));
+            };
+
+            var resultPath = await _processor.ProcessAsync(message, report, CancellationToken.None);
 
             await _statusStore.SetAsync(new TaskStatus(
                 TaskId: message.TaskId,

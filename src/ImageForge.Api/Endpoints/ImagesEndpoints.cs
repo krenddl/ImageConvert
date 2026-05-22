@@ -11,12 +11,21 @@ namespace ImageForge.Api.Endpoints;
 
 public static class ImagesEndpoints
 {
+    // Target formats we accept from clients. Worker uses the same set.
+    private static readonly HashSet<string> AllowedFormats = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "webp", "jpg", "jpeg", "png"
+    };
+
+    private const string DefaultFormat = "webp";
+    private const int DefaultMaxDimension = 1920;
+
     public static IEndpointRouteBuilder MapImagesEndpoints(this IEndpointRouteBuilder routes)
     {
         var group = routes.MapGroup("/api/images").WithTags("Images");
 
         group.MapPost("/", UploadAsync)
-             .DisableAntiforgery() // multipart upload without an HTML form / token
+             .DisableAntiforgery()
              .WithName("UploadImage");
 
         group.MapGet("/{taskId}", GetStatusAsync)
@@ -26,9 +35,14 @@ public static class ImagesEndpoints
     }
 
     // POST /api/images
-    // multipart/form-data with field "file"; returns { taskId }.
+    // multipart/form-data:
+    //   file          (required)  the image to process
+    //   format        (optional)  "webp" | "jpg" | "jpeg" | "png"   default: webp
+    //   maxDimension  (optional)  integer; 0 means no resize        default: 1920
     private static async Task<Results<Ok<UploadResponse>, BadRequest<string>>> UploadAsync(
         [FromForm] IFormFile file,
+        [FromForm] string? format,
+        [FromForm] int? maxDimension,
         ImageStorage storage,
         QueuePublisher publisher,
         TaskStatusStore statusStore,
@@ -39,7 +53,36 @@ public static class ImagesEndpoints
             return TypedResults.BadRequest("File is empty.");
         }
 
-        // Compact, URL-safe id; uniqueness is enough for both Redis key and filename.
+        // Normalize the format: trim, lowercase, default to webp.
+        var targetFormat = string.IsNullOrWhiteSpace(format)
+            ? DefaultFormat
+            : format.Trim().ToLowerInvariant();
+
+        if (!AllowedFormats.Contains(targetFormat))
+        {
+            return TypedResults.BadRequest(
+                $"Unsupported format '{format}'. Allowed: {string.Join(", ", AllowedFormats)}.");
+        }
+
+        // Normalize maxDimension: 0 means "do not resize". Negative is invalid.
+        int? effectiveMaxDim;
+        if (maxDimension is null)
+        {
+            effectiveMaxDim = DefaultMaxDimension;
+        }
+        else if (maxDimension.Value < 0)
+        {
+            return TypedResults.BadRequest("maxDimension must be >= 0.");
+        }
+        else if (maxDimension.Value == 0)
+        {
+            effectiveMaxDim = null; // no resize
+        }
+        else
+        {
+            effectiveMaxDim = maxDimension.Value;
+        }
+
         var taskId = Guid.NewGuid().ToString("N");
         var extension = Path.GetExtension(file.FileName);
         var sourcePath = storage.BuildUploadPath(taskId, extension);
@@ -58,19 +101,15 @@ public static class ImagesEndpoints
             ResultPath: null,
             Error: null));
 
-        // Publish the work item; the worker will pick it up asynchronously.
         publisher.Publish(new TaskMessage(
             TaskId: taskId,
             SourcePath: sourcePath,
-            TargetFormat: "webp",
-            MaxDimension: 1920));
+            TargetFormat: targetFormat,
+            MaxDimension: effectiveMaxDim));
 
         return TypedResults.Ok(new UploadResponse(taskId));
     }
 
-    // GET /api/images/{taskId}
-    // Reads the current snapshot from Redis. 404 if the task id is unknown
-    // (never uploaded, or status expired).
     private static async Task<Results<Ok<TaskStatus>, NotFound>> GetStatusAsync(
         string taskId,
         TaskStatusStore statusStore)
