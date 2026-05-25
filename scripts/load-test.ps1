@@ -124,10 +124,13 @@ function Generate-Pack {
 
     Add-Type -AssemblyName System.Drawing
 
+    # GDI+ wants absolute paths and chokes on 32bppArgb when saving as JPEG.
+    $absPackDir = (Resolve-Path $PackDir).Path
+
     $alreadyHave = 0
     $needList = @()
     for ($i = 1; $i -le $Count; $i++) {
-        $fname = Join-Path $PackDir ('img-{0:D4}.jpg' -f $i)
+        $fname = Join-Path $absPackDir ('img-{0:D4}.jpg' -f $i)
         if ((Test-Path $fname) -and (Get-Item $fname).Length -gt 0) {
             $alreadyHave++
         } else {
@@ -143,39 +146,52 @@ function Generate-Pack {
 
     $sw = [Diagnostics.Stopwatch]::StartNew()
     $generated = 0
+    $failed    = 0
 
     foreach ($item in $needList) {
-        $rng = New-Object System.Random ($item.Index * 31 + 7)
-        $bmp = New-Object System.Drawing.Bitmap $GenWidth, $GenHeight
-        $g   = [System.Drawing.Graphics]::FromImage($bmp)
+        $bmp = $null; $g = $null
+        try {
+            $rng = New-Object System.Random ($item.Index * 31 + 7)
+            # 24bpp RGB is the right pixel format for JPEG; the default
+            # 32bppArgb causes "A generic error occurred in GDI+" on Save.
+            $bmp = New-Object System.Drawing.Bitmap $GenWidth, $GenHeight, ([System.Drawing.Imaging.PixelFormat]::Format24bppRgb)
+            $g   = [System.Drawing.Graphics]::FromImage($bmp)
 
-        # Random-ish backdrop, then a few large blocks for visual interest.
-        $bgR = $rng.Next(40, 240); $bgG = $rng.Next(40, 240); $bgB = $rng.Next(40, 240)
-        $g.Clear([System.Drawing.Color]::FromArgb($bgR, $bgG, $bgB))
+            $bgR = $rng.Next(40, 240); $bgG = $rng.Next(40, 240); $bgB = $rng.Next(40, 240)
+            $g.Clear([System.Drawing.Color]::FromArgb($bgR, $bgG, $bgB))
 
-        for ($k = 0; $k -lt 24; $k++) {
-            $r = $rng.Next(255); $gc = $rng.Next(255); $b = $rng.Next(255); $a = $rng.Next(120, 230)
-            $color = [System.Drawing.Color]::FromArgb($a, $r, $gc, $b)
-            $brush = New-Object System.Drawing.SolidBrush $color
-            $x = $rng.Next($GenWidth);  $y = $rng.Next($GenHeight)
-            $w = $rng.Next([int]($GenWidth/8), [int]($GenWidth/2))
-            $h = $rng.Next([int]($GenHeight/8), [int]($GenHeight/2))
-            $g.FillRectangle($brush, $x, $y, $w, $h)
-            $brush.Dispose()
+            for ($k = 0; $k -lt 24; $k++) {
+                $r = $rng.Next(255); $gc = $rng.Next(255); $b = $rng.Next(255)
+                # No alpha — JPEG does not support it, and using ARGB on a 24bpp
+                # canvas can also trip GDI+. Just opaque RGB.
+                $color = [System.Drawing.Color]::FromArgb($r, $gc, $b)
+                $brush = New-Object System.Drawing.SolidBrush $color
+                $x = $rng.Next($GenWidth);  $y = $rng.Next($GenHeight)
+                $w = $rng.Next([int]($GenWidth/8), [int]($GenWidth/2))
+                $h = $rng.Next([int]($GenHeight/8), [int]($GenHeight/2))
+                $g.FillRectangle($brush, $x, $y, $w, $h)
+                $brush.Dispose()
+            }
+
+            $bmp.Save($item.Path, [System.Drawing.Imaging.ImageFormat]::Jpeg)
+            $generated++
+        } catch {
+            $failed++
+            if ($failed -le 3) { Warn ("failed at {0}: {1}" -f $item.Path, $_.Exception.Message) }
+        } finally {
+            if ($g)   { $g.Dispose()   }
+            if ($bmp) { $bmp.Dispose() }
         }
 
-        $bmp.Save($item.Path, [System.Drawing.Imaging.ImageFormat]::Jpeg)
-        $g.Dispose(); $bmp.Dispose()
-        $generated++
-
-        if ($generated % 25 -eq 0) {
-            Write-Host -NoNewline ("`r  {0,5} / {1}" -f $generated, $needList.Count) -ForegroundColor DarkGray
+        if (($generated + $failed) % 25 -eq 0) {
+            Write-Host -NoNewline ("`r  {0,5} / {1}  (ok={2} failed={3})" -f ($generated + $failed), $needList.Count, $generated, $failed) -ForegroundColor DarkGray
         }
     }
     Write-Host ''
 
     Note ("elapsed: {0}s" -f [int]$sw.Elapsed.TotalSeconds)
     Ok   ("generated: $generated, already had: $alreadyHave")
+    if ($failed -gt 0) { Warn "failed: $failed" }
 }
 
 # --- upload -----------------------------------------------------------------
