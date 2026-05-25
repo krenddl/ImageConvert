@@ -22,7 +22,7 @@
 set -e
 
 # Defaults --------------------------------------------------------------------
-: "${COUNT:=500}"
+: "${COUNT:=5000}"
 : "${CONCURRENCY:=20}"
 : "${PACK_DIR:=./test-pack}"
 : "${API:=http://localhost:8080}"
@@ -163,20 +163,37 @@ upload_pack() {
     (( fail_count > 0 )) && warn "non-200: $fail_count"
 
     section "Waiting for workers to drain..."
-    local idle_rounds=0
-    while (( idle_rounds < 3 )); do
-        sleep 2
+    # Use lifetime-stats.processed (not cached) as the truth source.
+    # /api/stats from RabbitMQ management API caches ~5s and can show ready=0
+    # while workers are still acking in flight tasks.
+    local target=$((before_processed + ok_count))
+    local wait_started=$(date +%s)
+    while true; do
+        local now=$(date +%s)
+        if (( now - wait_started > 600 )); then
+            warn "timeout (10 min) waiting for tasks to complete"
+            break
+        fi
+
+        local cur_json
+        cur_json=$(curl -sS "$API/api/lifetime-stats")
+        local cur=$(echo "$cur_json" | grep -oE '"processed":[0-9]+' | cut -d: -f2)
+        cur=${cur:-0}
+
         local stats
         stats=$(curl -sS "$API/api/stats")
-        local ready=$(echo    "$stats" | grep -oE '"messagesReady":[0-9]+'         | cut -d: -f2)
+        local ready=$(echo    "$stats" | grep -oE '"messagesReady":[0-9]+'          | cut -d: -f2)
         local inflight=$(echo "$stats" | grep -oE '"messagesUnacknowledged":[0-9]+' | cut -d: -f2)
-        local consumers=$(echo "$stats" | grep -oE '"consumers":[0-9]+'             | cut -d: -f2)
-        printf '  ready=%-4s inflight=%-3s consumers=%s\n' "${ready:-?}" "${inflight:-?}" "${consumers:-?}"
-        if [[ "${ready:-0}" == "0" && "${inflight:-0}" == "0" ]]; then
-            idle_rounds=$((idle_rounds + 1))
-        else
-            idle_rounds=0
+        local done_so_far=$((cur - before_processed))
+
+        printf '  processed: %d / %d  (ready=%s inflight=%s)\n' \
+            "$done_so_far" "$ok_count" "${ready:-?}" "${inflight:-?}"
+
+        if (( cur >= target )); then
+            ok "all $ok_count tasks completed"
+            break
         fi
+        sleep 3
     done
 
     local end_ts=$(date +%s)

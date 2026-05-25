@@ -103,7 +103,7 @@ function Download-Pack {
         }
 
         $done = $batchEnd + 1
-        Write-Host -NoNewline ("`r  {0,4} / {1}" -f $done, $needList.Count) -ForegroundColor DarkGray
+        Write-Host -NoNewline ("`r  {0,5} / {1}  (fetched={2} failed={3})" -f $done, $needList.Count, $fetched, $failed) -ForegroundColor DarkGray
         $batchStart = $batchEnd + 1
     }
 
@@ -180,14 +180,29 @@ function Upload-Pack {
     if ($other -gt 0) { Warn "non-200: $other" }
 
     Section 'Waiting for workers to drain'
-    $idleRounds = 0
-    while ($idleRounds -lt 3) {
-        Start-Sleep -Seconds 2
+    # Trust /api/lifetime-stats.processed (not cached) as the source of truth.
+    # /api/stats caches ~5s and can flash ready=0 while workers are still
+    # acking — we'd otherwise call it "done" too early.
+    $target       = $before.processed + $ok200
+    $waitStarted  = Get-Date
+    while ($true) {
+        if ((Get-Date) - $waitStarted -gt [TimeSpan]::FromMinutes(10)) {
+            Warn "timeout (10 min) waiting for tasks to complete"
+            break
+        }
         try {
-            $s = (Invoke-WebRequest "$ApiUrl/api/stats" -UseBasicParsing).Content | ConvertFrom-Json
-            Write-Host ('  ready={0,-4} inflight={1,-3} consumers={2}' -f $s.messagesReady, $s.messagesUnacknowledged, $s.consumers)
-            if ($s.messagesReady -eq 0 -and $s.messagesUnacknowledged -eq 0) { $idleRounds++ } else { $idleRounds = 0 }
-        } catch { $idleRounds = 99 }
+            $lt = (Invoke-WebRequest "$ApiUrl/api/lifetime-stats" -UseBasicParsing).Content | ConvertFrom-Json
+            $st = (Invoke-WebRequest "$ApiUrl/api/stats"          -UseBasicParsing).Content | ConvertFrom-Json
+            $doneSoFar = $lt.processed - $before.processed
+            Write-Host ('  processed: {0,5} / {1}  (ready={2,-4} inflight={3,-3})' -f $doneSoFar, $ok200, $st.messagesReady, $st.messagesUnacknowledged)
+            if ($lt.processed -ge $target) {
+                Ok "all $ok200 tasks completed"
+                break
+            }
+        } catch {
+            Warn "stats unreachable"; break
+        }
+        Start-Sleep -Seconds 3
     }
 
     $sw.Stop()
